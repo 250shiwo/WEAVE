@@ -26,7 +26,7 @@
 
 ## 3. 架构（方案 A：单进程）
 
-一个 Python 进程承载全部职责：FastAPI（REST）+ FastMCP（`/mcp`）+ 进程内 asyncio worker（消费 Redis 队列）。**关键约束**：SQLite / LanceDB / Kuzu 均为嵌入式单写者数据库（Kuzu 以独占锁打开库文件），单进程拓扑天然满足该约束；LLM 抽取等阻塞操作用 `asyncio.to_thread` 隔离，避免阻塞事件循环。
+一个 Python 进程承载全部职责：FastAPI（REST）+ FastMCP（`/mcp`）+ 进程内 asyncio worker（消费 Redis 队列）。**关键约束**：SQLite / LanceDB / Kuzu 均为嵌入式单写者数据库（Kuzu 以独占锁打开库文件），单进程拓扑天然满足该约束。LLM 抽取与 Kuzu/LanceDB 原生调用等阻塞操作统一收敛到一个 **max_workers=1 的专用线程池**（串行化 DB 写入，匹配单写者约束），并用 `asyncio.wait_for` 包裹超时，防止原生调用卡死拖住事件循环（见 §8）。
 
 ```
 weave/                        # Python 包, uv 管理, Python 3.11+
@@ -170,7 +170,7 @@ agent 明确指定的记忆，视为已筛选：
 |---|---|
 | ① 认知过滤器 | 会话记忆进图**必须**经过 improve 管线的 LLM 过滤：区分「持久事实/偏好」与「一次性事件/闲聊」，后者直接丢弃不进图。不允许任何会话原文直通图/向量库 |
 | ② 重要性门禁 | 过滤器内含 keep/discard 判定（"值得跨会话长期记住吗"）。**不存储数值权重、不参与排序**（与去掉权重字段的决策一致），仅作进图前的一次性闸门 |
-| ③ 上下文隔离 | 存储隔离：会话原文只存 Redis，永不进图/向量库；血缘隔离：会话来源事实标 `source_pipeline="session_improve"`，可溯源、可单独清理；检索隔离：recall 返回按 `source="session"/"graph"` 标注 |
+| ③ 上下文隔离 | 存储隔离：会话原文只存 Redis，永不进图/向量库；血缘隔离：会话来源事实标 `source_pipeline="session_improve"`，可溯源；检索隔离：recall 返回按 `source="session"/"graph"` 标注。配套内部方法 `forget_by_source(source_pipeline)`（core 层，v1 不暴露 MCP/REST 接口）：删除指定来源的全部关系事实（SQLite edges + Kuzu RELATES_TO，含历史版本）并置对应 data 记录状态；实体节点可能被多个来源共享，故保留不删 |
 
 ## 7. 接口设计
 
@@ -202,9 +202,10 @@ agent 明确指定的记忆，视为已筛选：
 ## 8. 错误处理
 
 - **LLM/embedding 调用**：3 次指数退避重试。同步 remember 失败 → 图/向量不落半成品（先抽取成功，再统一写三库）；`data` 记录已落库的标记 `status=failed`，可凭 content_hash 幂等重试。异步任务失败 → `pipeline_runs` 置 failed + error，可重新提交
+- **DB 原生调用防护**：所有 Kuzu/LanceDB 原生调用经专用单线程执行器提交，外层 `asyncio.wait_for` 包裹 `DB_CALL_TIMEOUT`（默认 30s）超时；锁竞争类瞬时错误重试 `DB_CALL_MAX_RETRIES`（默认 2）次，约束冲突等确定性错误不重试。已知限制：线程内真正卡死的原生调用无法强杀（线程泄漏至进程重启），但事件循环与 API 保持可用、调用方收到超时错误；若后续遇到 Kuzu 稳定性问题，再升级为 cognee 式子进程 harness
 - **三库一致性**：无分布式事务，采用"SQLite 状态字段 + 顺序写"，v1 接受最终一致，失败记录可人工排查
 - **文件锁冲突**：启动时检测 Kuzu/LanceDB 被其他进程占用 → 清晰报错退出
-- **队列**：单 worker 串行消费（匹配嵌入式 DB 单写者），`weave:queue:improve` 优先于 `weave:queue:cognify`；队列积压打日志
+- **队列**：单 worker 单循环串行消费（匹配嵌入式 DB 单写者）。优先级实现模式写死：循环内单次 `BRPOP [weave:queue:improve, weave:queue:cognify]`（key 顺序即优先级，Redis 按 key 顺序扫描，improve 有货必先发）+ `QUEUE_POLL_TIMEOUT`（默认 5s）防止永久阻塞以便响应关闭信号；**禁止**拆成两个队列各自独立 BRPOP（两个并发消费者会使优先级失效）。队列积压打日志
 - **错误返回**：REST 标准状态码 + `{error: {code, message}}`；MCP 工具返回结构化 `isError` 内容，agent 可读
 
 ## 9. 测试策略
@@ -226,6 +227,9 @@ SESSION_MAX_ITEMS=50        # 会话缓存上限
 SESSION_TTL_DAYS=7          # 会话缓存 TTL
 CHUNK_SIZE=1500             # 切块字符数
 CHUNK_OVERLAP=200
+DB_CALL_TIMEOUT=30          # Kuzu/LanceDB 原生调用超时(秒)
+DB_CALL_MAX_RETRIES=2       # 锁竞争类瞬时错误重试次数
+QUEUE_POLL_TIMEOUT=5        # worker BRPOP 阻塞超时(秒)
 ```
 
 ## 11. MySmallAgent 集成说明
