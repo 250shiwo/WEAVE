@@ -287,11 +287,11 @@ async def test_run_db_success():
 
 async def test_run_db_timeout_keeps_loop_responsive():
     def stuck():
-        time.sleep(5)
+        time.sleep(0.5)
 
     with pytest.raises((asyncio.TimeoutError, TimeoutError)):
         await run_db(stuck, timeout=0.05, max_retries=0)
-    # 事件循环未被拖死，后续调用可立即执行
+    # 事件循环未被拖死，后续调用可立即执行（stuck 线程 0.5s 后释放，1.0s 预算足够）
     assert await run_db(lambda: "alive", timeout=1.0) == "alive"
 
 
