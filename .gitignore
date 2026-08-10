@@ -1,7 +1,7 @@
-# 环境与密钥
+# 鐜��涓庡瘑閽�
 .env
 
-# 数据目录（SQLite / LanceDB / Kuzu 产物）
+# 鏁版嵁鐩�綍锛圫QLite / LanceDB / Kuzu 浜х墿锛�
 data/
 
 # Python
@@ -11,10 +11,11 @@ __pycache__/
 venv/
 .ruff_cache/
 .pytest_cache/
+.pytest_tmp/
 
 # IDE
 .idea/
 .vscode/
 
-# SDD ִ��̨�ˣ��������ݸ壩
+# SDD 执行台账（控制器草稿）
 .superpowers/

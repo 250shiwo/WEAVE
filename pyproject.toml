@@ -30,6 +30,8 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# 沙箱环境可能禁写 %TEMP%，tmp_path 统一落在工作区（已被 .gitignore 排除）
+addopts = "--basetemp=.pytest_tmp"
 
 [build-system]
 requires = ["hatchling"]
