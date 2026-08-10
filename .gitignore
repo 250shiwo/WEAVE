@@ -1,0 +1,17 @@
+# 环境与密钥
+.env
+
+# 数据目录（SQLite / LanceDB / Kuzu 产物）
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ruff_cache/
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
