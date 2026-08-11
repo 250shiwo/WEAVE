@@ -92,6 +92,29 @@ class MemoryService:
                                    data_name=f"remember:{content[:40]}")
         return {"mode": "permanent", **result}
 
+    async def recall(self, query: str, dataset: str | None = None,
+                     top_k: int = 5, session_id: str | None = None) -> dict:
+        """回忆查询：混合检索的门面入口（remember 的查询侧配对）。
+
+        做什么: 把调用原样委托给 retrieval.hybrid_recall——query 向量化后
+            在 text_chunks/entities 双表各取 top_k 入口，经 Kuzu 1 跳图扩展
+            （仅 is_latest 边）出事实，图关联块回查 LanceDB 原文补充，
+            最后按 session_id 叠加会话缓存原文。
+        参数:
+            query: 查询文本。
+            dataset: 可选数据集过滤；为 None 时跨全部数据集检索。
+            top_k: 双表各自的向量入口条数上限，默认 5。
+            session_id: 可选会话标识；非空时叠加该会话的缓存原文。
+        返回:
+            dict: RecallResult 结构 {facts, chunks, session_items}；
+                fact 标 origin="graph"，chunk 标 source="vector"/"graph"，
+                会话项标 source="session"。
+        """
+        # 延迟导入避免循环依赖：retrieval 只依赖 svc 协议，不反向 import service
+        from weave.core.retrieval import hybrid_recall
+
+        return await hybrid_recall(self, query, dataset, top_k, session_id)
+
     async def run_improve(self, session_id: str, dataset: str = "default",
                           task_id: str = "") -> dict:
         """触发一次会话记忆沉淀：improve_session 管线的门面入口。
