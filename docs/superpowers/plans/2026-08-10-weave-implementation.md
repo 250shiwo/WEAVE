@@ -935,6 +935,8 @@ def _hard_split(text: str, chunk_size: int, overlap: int) -> list[str]:
     start = 0
     while start < len(text):
         pieces.append(text[start:start + chunk_size])
+        if start + chunk_size >= len(text):
+            break  # 末尾已覆盖, 不再产生冗余尾巴块
         start += step
     return pieces
 ```
