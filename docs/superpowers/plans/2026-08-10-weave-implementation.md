@@ -3311,6 +3311,8 @@ git add weave/api tests/test_api.py; git commit -m "feat: REST 开放 API 与 Be
 
 **挂载要点:** FastMCP 用默认 `streamable_http_path="/mcp"`；`app.mount("/", mcp.streamable_http_app())` 必须放在 `include_router` **之后**（Starlette 按序匹配，`/v1/*` 先中）；lifespan 必须运行 `mcp.session_manager.run()`，否则 MCP 请求报 session 错误。
 
+**执行期裁定（已实施）:** 环境实际安装 mcp 2.0.0（`mcp>=1.9` 解析），FastMCP 2.x 拆分为独立包，本任务代码按 2.x API 机械适配（`MCPServer`、`stateless_http`/`json_response` 移至 `streamable_http_app()`、客户端 `streamable_http_client` + `create_mcp_http_client`、`is_error`、`structured_content["result"]`），行为与本计划规定完全等价，已经评审对照 SDK 源码核实。
+
 - [ ] **Step 1: 写失败测试**
 
 `tests/test_e2e_mcp.py`:
