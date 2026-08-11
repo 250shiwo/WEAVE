@@ -1,4 +1,8 @@
-"""写入管线: ingest_text (remember/cognify/improve 共用) — spec §5.1 三阶段写."""
+"""写入管线: ingest_text (remember/cognify/improve 共用) — spec §5.1 三阶段写.
+
+improve_session 为会话记忆沉淀管线 (spec §5.3/§6): 会话原文只进 Redis,
+LLM 过滤后的陈述句才复用 ingest_text 入图, 血缘隔离标记 session_improve。
+"""
 
 from weave.core.chunking import split_text
 from weave.core.extraction import extract_graph
@@ -172,3 +176,62 @@ async def ingest_text(svc, text: str, dataset: str, source_pipeline: str,
     return {"data_id": data_id, "dataset": dataset, "deduplicated": False,
             "entities": len(new_entity_ids), "relationships": len(edge_plan),
             "superseded": len(supersede_plan), "chunks": len(chunk_texts)}
+
+
+async def improve_session(svc, session_id: str, dataset: str = "default",
+                          task_id: str = "") -> dict:
+    """会话记忆沉淀: LLM 认知过滤 + 重要性门禁, 通过后才走标准入图 (spec §5.3/§6).
+
+    做什么: 取出会话中尚未同步的原文消息，先经 LLM 认知过滤（只保留用户画像/
+        偏好/稳定事实/重要决定，一次性事件与闲聊一律丢弃）；存在保留事实时
+        才拼成文本走标准 ingest_text 三阶段入图，血缘标记 source_pipeline=
+        "session_improve"；无论是否入图，最后都会把会话标记为已同步。
+        防污染关键：会话原文永不直接入图，只有过滤后的陈述句可以进入。
+    参数:
+        svc: MemoryService 门面（提供 db()/settings/cache/llm/三库引用）。
+        session_id: 会话标识，对应 Redis 中的会话 list。
+        dataset: 目标数据集名，默认 "default"。
+        task_id: 队列任务 ID；非空时同步流转 pipeline_run 状态
+            （running -> completed/failed），为空（直接调用）时跳过状态流转。
+    返回:
+        dict: {kept: 保留事实数, discarded: 丢弃消息数,
+            ingested: ingest_text 结果或 None（无保留/无未同步消息时不写图）}。
+    异常:
+        Exception: 任一环节失败时先把 pipeline_run 标记 failed（含错误信息），
+            再原样上抛给调用方。
+    """
+    # 延迟导入：保持 pipelines 只依赖 svc 协议，避免模块级依赖扩散
+    from weave.core.extraction import filter_session_facts
+    from weave.core.session import get_unsynced, mark_synced
+
+    # 有 task_id（队列消费路径）时先把运行记录置为 running
+    if task_id:
+        await svc.db(svc.relational.update_pipeline_run, task_id, "running")
+    try:
+        # 只取未同步的增量消息；已同步的历史原文不重复处理
+        items = await get_unsynced(svc.cache, session_id)
+        if not items:
+            # 无待处理内容：直接置 completed 并返回零计数，不触碰 LLM 与图库
+            if task_id:
+                await svc.db(svc.relational.update_pipeline_run, task_id, "completed")
+            return {"kept": 0, "discarded": 0, "ingested": None}
+        # LLM 认知过滤（防污染门禁）：输入为消息原文列表，输出 keep 的陈述句
+        statements = await filter_session_facts(svc.llm, [i["content"] for i in items])
+        result = None
+        if statements:
+            # 重要性门禁通过：仅过滤后的陈述句拼成文本走标准三阶段入图；
+            # 血缘隔离标记 source_pipeline="session_improve"、source_task="improve"
+            result = await ingest_text(svc, "\n".join(statements), dataset,
+                                       "session_improve", "improve",
+                                       data_name=f"session:{session_id}")
+        # 全部丢弃时跳过入图；无论是否入图都标记已同步（原文保留供 recall）
+        await mark_synced(svc.cache, svc.settings, session_id)
+        if task_id:
+            await svc.db(svc.relational.update_pipeline_run, task_id, "completed")
+        return {"kept": len(statements), "discarded": len(items) - len(statements),
+                "ingested": result}
+    except Exception as exc:
+        # 失败路径：运行记录置 failed 并携带错误信息，异常原样上抛
+        if task_id:
+            await svc.db(svc.relational.update_pipeline_run, task_id, "failed", str(exc))
+        raise
