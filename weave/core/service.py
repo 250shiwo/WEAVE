@@ -263,3 +263,55 @@ class MemoryService:
             # 未知任务：以 not_found 状态明示，而非返回 None 或抛异常
             return {"task_id": task_id, "status": "not_found"}
         return run
+
+    async def forget(self, dataset: str | None = None, confirm: bool = False) -> dict:
+        """遗忘入口：按数据集级联清三库；dataset=None 时清空全部记忆（需 confirm=True）。
+
+        做什么: 删除侧门面方法，具体级联逻辑委托 cleanup.forget_dataset——
+            - 指定 dataset：只清空该数据集（SQLite 关联行/边/孤立 data +
+              Kuzu 节点边 + LanceDB 向量行）；
+            - dataset 为 None：全清语义，属于高危操作，必须显式传
+              confirm=True 才执行，否则抛 ValueError；确认后枚举关系库中
+              全部数据集名，逐个走 forget_dataset 级联清空。
+        参数:
+            dataset: 待清空的数据集名；为 None 时表示清空全部记忆。
+            confirm: 全清确认开关，仅 dataset 为 None 时生效；缺省 False
+                时拒绝执行（防误操作）。
+        返回:
+            dict: 指定数据集时为 {"scope": 数据集名, "data", "edges"}；
+                全清时为 {"scope": "all", "datasets": [各数据集的清理结果]}。
+        异常:
+            ValueError: dataset 为 None 且 confirm 为 False 时抛出，
+                错误消息含 "confirm"。
+        """
+        # 延迟导入避免循环依赖：cleanup 只依赖 svc 协议，不反向 import service
+        from weave.core.cleanup import forget_dataset
+
+        if dataset is None:
+            # 全清是高危操作：未显式确认时直接拒绝，不产生任何删除
+            if not confirm:
+                raise ValueError("清空全部记忆需要 confirm=True")
+            # 枚举关系库中全部数据集名，作为全清的删除清单
+            names = [d["name"] for d in await self.db(self.relational.list_datasets)]
+            # 逐个数据集级联清三库，汇总每个数据集的清理结果
+            return {"scope": "all",
+                    "datasets": [await forget_dataset(self, n) for n in names]}
+        # 单数据集清理：直接委托 cleanup.forget_dataset
+        return await forget_dataset(self, dataset)
+
+    async def forget_by_source(self, source_pipeline: str) -> dict:
+        """按来源管线清理关系事实：core 内部方法 (spec §6③)，不暴露 MCP/REST。
+
+        做什么: 把调用原样委托给 cleanup.forget_by_source——只删除该来源
+            产生的 SQLite edges 元数据（含全部历史版本）与 Kuzu RELATES_TO
+            边；实体节点可能被多来源共享，一律保留。
+        参数:
+            source_pipeline: 来源管线名（如 "session_improve"，用于清理
+                会话沉淀产生的关系事实）。
+        返回:
+            dict: {"scope": "source:<来源>", "edges_sql", "edges_graph"}。
+        """
+        # 延迟导入避免循环依赖；重命名 _impl 以与本方法区分
+        from weave.core.cleanup import forget_by_source as _impl
+
+        return await _impl(self, source_pipeline)
