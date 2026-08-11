@@ -1,9 +1,11 @@
 """pytest 共享夹具：为全部测试提供隔离、可重复的 Settings 实例。"""
 
+import fakeredis.aioredis
 import pytest
 
 from weave.config import Settings
 from weave.core.service import MemoryService
+from weave.infra.cache import Cache
 from weave.infra.graph import GraphStore
 from weave.infra.relational import RelationalStore
 from weave.infra.vector import VectorStore
@@ -86,3 +88,23 @@ def make_service(settings, stores):
         return MemoryService(settings, rel, vec, graph, cache,
                              llm or FakeLLM(), embedder or FakeEmbedder())
     return factory
+
+
+@pytest.fixture
+async def fake_cache(settings):
+    """构建一个注入 fakeredis 假客户端的 Cache 实例（无真实 Redis 依赖）。
+
+    做什么: 用 fakeredis.aioredis.FakeRedis 作为底层客户端构造 Cache，
+        在进程内模拟完整 Redis 协议行为（list/expire/BRPOP 等），
+        让会话记忆与任务队列测试无需启动真实 Redis 服务。
+    参数:
+        settings: 上面的 settings 夹具，提供 redis_host/port/db 配置值
+            （仅作构造参数透传，实际连接由 FakeRedis 接管）。
+    返回:
+        Cache: 底层客户端为 FakeRedis（decode_responses=True，返回 str）
+            的缓存封装实例；测试结束后关闭连接释放资源。
+    """
+    c = Cache(settings.redis_host, settings.redis_port, settings.redis_db,
+              client=fakeredis.aioredis.FakeRedis(decode_responses=True))
+    yield c
+    await c.close()
