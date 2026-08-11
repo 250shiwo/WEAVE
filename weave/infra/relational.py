@@ -348,6 +348,21 @@ class RelationalStore:
                 s.add(DatasetDataRow(dataset_id=dataset_id, data_id=data_id))
                 s.commit()
 
+    def is_data_linked(self, dataset_id: str, data_id: str) -> bool:
+        """判断指定数据是否已关联到指定数据集（remember 去重判定依赖此接口）。
+
+        做什么: 内容哈希命中只能说明文本曾经写入过，还必须确认该数据确实挂在
+            当前数据集下，才算真正的重复写入；跨数据集的同名同文数据不视为重复。
+        参数:
+            dataset_id: 数据集主键。
+            data_id: 数据主键。
+        返回:
+            bool: True 表示关联行已存在（同数据集重复），False 表示未关联。
+        """
+        with Session(self.engine) as s:
+            # 联合主键精确查询：命中即已关联
+            return s.get(DatasetDataRow, {"dataset_id": dataset_id, "data_id": data_id}) is not None
+
     # ---------- edges ----------
     def upsert_edge(self, edge: dict) -> None:
         """插入或更新一条边元数据（按 edge_id 判存在）。
