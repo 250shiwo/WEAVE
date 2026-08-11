@@ -1,7 +1,7 @@
-# 鐜��涓庡瘑閽�
+# 配置文件
 .env
 
-# 鏁版嵁鐩�綍锛圫QLite / LanceDB / Kuzu 浜х墿锛�
+# 数据目录
 data/
 
 # Python
