@@ -3264,7 +3264,7 @@ def create_app(settings: Settings, service: MemoryService | None = None) -> Fast
         finally:
             stop.set()
             worker.cancel()
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await worker
 
     app = FastAPI(title="Weave", docs_url=None, redoc_url=None,
@@ -3463,7 +3463,7 @@ def create_app(settings: Settings, service: MemoryService | None = None) -> Fast
             finally:
                 stop.set()
                 worker.cancel()
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
                     await worker
 
     app = FastAPI(title="Weave", docs_url=None, redoc_url=None,
