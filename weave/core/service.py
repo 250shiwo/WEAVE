@@ -126,3 +126,117 @@ class MemoryService:
             # entity_count 只能查图库：实体节点只存在于 Kuzu，按数据集名过滤
             row["entity_count"] = await self.db(self.graph.count_entities, row["name"])
         return stats
+
+    async def cognify_submit(self, file_name: str, content_base64: str,
+                             dataset: str = "default") -> dict:
+        """提交一份 base64 编码的文档：校验解码、落记录、去重判定、入 cognify 队列。
+
+        做什么:
+            1. 校验文件扩展名（v1 仅支持 txt/md/markdown）并解码 base64 为
+               UTF-8 文本，任一失败抛 ValueError（不产生任何写入）；
+            2. 按解码后文本的内容哈希去重：哈希命中且已挂在当前数据集下时，
+               只补一条已完成的 pipeline_run 记录作为审计痕迹，直接返回
+               completed + deduplicated（不入队、不重复抽取）；
+            3. 未命中时创建 data 记录（source_pipeline="cognify"）并关联数据集，
+               创建 pending 状态的 pipeline_run，把 {task_id, data_id, dataset}
+               载荷入 QUEUE_COGNIFY，等待 worker 异步执行 run_cognify_task。
+        参数:
+            file_name: 原始文件名（仅用扩展名判断类型，并作为 data 记录名称）。
+            content_base64: 文件内容的 base64 编码字符串（解码后须为 UTF-8）。
+            dataset: 目标数据集名，默认 "default"。
+        返回:
+            dict: 新任务为 {task_id, data_id, status: "pending"}；
+                去重命中时额外带 deduplicated: True 且 status 为 "completed"。
+        异常:
+            ValueError: 扩展名不支持或 base64 解码失败时抛出。
+        """
+        import base64
+        from pathlib import Path
+
+        from weave.core.models import content_hash, new_id
+        from weave.infra.cache import QUEUE_COGNIFY
+
+        # 扩展名白名单校验：v1 只支持纯文本/Markdown，其余直接拒绝
+        suffix = Path(file_name).suffix.lower()
+        if suffix not in {".txt", ".md", ".markdown"}:
+            raise ValueError(f"暂不支持的文件类型: {suffix} (v1 支持 txt/md)")
+        try:
+            # base64 解码为字节串后再按 UTF-8 解码为文本
+            raw = base64.b64decode(content_base64).decode("utf-8")
+        except Exception as exc:
+            # 统一包装为 ValueError，调用方只需捕获一种异常
+            raise ValueError(f"无法解码 base64 文件内容: {exc}") from exc
+
+        # 数据集按名获取/创建（幂等），后续关联与去重判定都基于它的内部 id
+        ds = await self.db(self.relational.get_or_create_dataset, dataset)
+        # 内容哈希去重：同文本同数据集只入库一次
+        ch = content_hash(raw)
+        existing = await self.db(self.relational.get_data_by_hash, ch)
+        if existing and await self.db(self.relational.is_data_linked, ds["id"], existing["id"]):
+            # 去重命中：补一条直接置 completed 的运行记录作为审计痕迹，不入队
+            task_id = new_id()
+            await self.db(self.relational.create_pipeline_run, task_id, "cognify", existing["id"])
+            await self.db(self.relational.update_pipeline_run, task_id, "completed")
+            return {"task_id": task_id, "data_id": existing["id"],
+                    "status": "completed", "deduplicated": True}
+
+        # 未命中：先落 data 记录（状态 created，由 run_cognify_task 流转终态）
+        data_id = new_id()
+        await self.db(self.relational.create_data, data_id, file_name, raw, ch, "cognify")
+        await self.db(self.relational.link_dataset_data, ds["id"], data_id)
+        # 建立 pending 状态的运行记录，供 task_status 查询进度
+        task_id = new_id()
+        await self.db(self.relational.create_pipeline_run, task_id, "cognify", data_id)
+        # 载荷键名与 run_cognify_task 参数名一致，worker 直接 **payload 分发
+        await self.cache.enqueue(QUEUE_COGNIFY,
+                                 {"task_id": task_id, "data_id": data_id, "dataset": dataset})
+        return {"task_id": task_id, "data_id": data_id, "status": "pending"}
+
+    async def run_cognify_task(self, task_id: str, data_id: str, dataset: str) -> None:
+        """执行一条 cognify 任务：取已落库文本走标准入图管线，流转运行状态。
+
+        做什么: 先把 pipeline_run 置 running；按 data_id 取出 cognify_submit
+            阶段已落库的 data 记录，复用 ingest_text 三阶段写（传 data_id=
+            跳过去重建记录，血缘标记 source_pipeline/source_task 均为
+            "cognify"）；成功置 completed，失败置 failed 并记录错误信息。
+        参数:
+            task_id: 队列任务 ID（pipeline_run 主键，由 cognify_submit 创建）。
+            data_id: 待入图的数据记录 ID（记录已在提交阶段落库）。
+            dataset: 目标数据集名。
+        返回: 无。
+        异常: 不抛出——任何失败都只把运行记录置 failed（含错误文本）后返回，
+            worker 主循环的 except 仅作兜底。
+        """
+        from weave.core.pipelines import ingest_text
+
+        # 状态流转第一步：pending -> running
+        await self.db(self.relational.update_pipeline_run, task_id, "running")
+        try:
+            # 取提交阶段已落库的 data 记录；记录缺失视为失败（走 except 置 failed）
+            record = await self.db(self.relational.get_data, data_id)
+            if record is None:
+                raise ValueError(f"data 记录不存在: {data_id}")
+            # 传 data_id= 走 cognify 分支：跳过去重建记录，直接入图已有文本
+            await ingest_text(self, record["raw_text"], dataset, "cognify", "cognify",
+                              record["name"], data_id=data_id)
+            # 全部写入完成：running -> completed
+            await self.db(self.relational.update_pipeline_run, task_id, "completed")
+        except Exception as exc:
+            # 失败不抛出：running -> failed 并携带错误信息，供 task_status 查询
+            await self.db(self.relational.update_pipeline_run, task_id, "failed", str(exc))
+
+    async def task_status(self, task_id: str) -> dict:
+        """查询队列任务的运行状态（pipeline_run 记录的只读视图）。
+
+        参数:
+            task_id: 队列任务 ID。
+        返回:
+            dict: 存在时返回完整运行记录行（task_id/pipeline_name/data_id/
+                status/error/created_at/updated_at）；不存在时返回
+                {"task_id": task_id, "status": "not_found"}，不抛异常。
+        """
+        run = await self.db(self.relational.get_pipeline_run, task_id)
+        if run is None:
+            # 未知任务：以 not_found 状态明示，而非返回 None 或抛异常
+            return {"task_id": task_id, "status": "not_found"}
+        return run
