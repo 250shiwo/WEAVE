@@ -294,16 +294,28 @@ class RelationalStore:
             s.commit()
             return _to_dict(row)
 
-    def get_data_by_hash(self, content_hash: str) -> dict | None:
-        """按内容哈希查询数据（remember 去重依赖此接口）。
+    def get_data_by_hash(self, content_hash: str, dataset_id: str) -> dict | None:
+        """按内容哈希 + 数据集联表查 data 记录（去重判定限定在数据集内）。
 
+        做什么: 经 dataset_data 关联表联查，只命中"同哈希且挂在当前数据集下"
+            的数据行；跨数据集的同名同文数据互不干扰（各自独立建行），
+            同时避免全表同哈希多行导致 scalar_one_or_none 抛
+            MultipleResultsFound（C1 修复）。联表条件已含关联语义，
+            调用方无需再单独判断数据是否挂在数据集下。
         参数:
             content_hash: 内容哈希字符串。
+            dataset_id: 数据集主键（去重判定的命名空间边界）。
         返回:
-            dict | None: 命中的数据行；不存在时返回 None。
+            dict | None: 命中的数据行；当前数据集内不存在时返回 None。
         """
         with Session(self.engine) as s:
-            row = s.execute(select(DataRow).where(DataRow.content_hash == content_hash)).scalar_one_or_none()
+            # 联表过滤：同哈希 + 同数据集双条件；first() 防御同库极端多行
+            row = s.execute(
+                select(DataRow)
+                .join(DatasetDataRow, DatasetDataRow.data_id == DataRow.id)
+                .where(DataRow.content_hash == content_hash,
+                       DatasetDataRow.dataset_id == dataset_id)
+            ).scalars().first()
             return _to_dict(row) if row else None
 
     def get_data(self, data_id: str) -> dict | None:
@@ -347,21 +359,6 @@ class RelationalStore:
             if not exists:
                 s.add(DatasetDataRow(dataset_id=dataset_id, data_id=data_id))
                 s.commit()
-
-    def is_data_linked(self, dataset_id: str, data_id: str) -> bool:
-        """判断指定数据是否已关联到指定数据集（remember 去重判定依赖此接口）。
-
-        做什么: 内容哈希命中只能说明文本曾经写入过，还必须确认该数据确实挂在
-            当前数据集下，才算真正的重复写入；跨数据集的同名同文数据不视为重复。
-        参数:
-            dataset_id: 数据集主键。
-            data_id: 数据主键。
-        返回:
-            bool: True 表示关联行已存在（同数据集重复），False 表示未关联。
-        """
-        with Session(self.engine) as s:
-            # 联合主键精确查询：命中即已关联
-            return s.get(DatasetDataRow, {"dataset_id": dataset_id, "data_id": data_id}) is not None
 
     # ---------- edges ----------
     def upsert_edge(self, edge: dict) -> None:

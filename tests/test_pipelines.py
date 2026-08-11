@@ -102,7 +102,9 @@ async def test_remember_llm_failure_writes_no_partial_graph(make_service, stores
     # 阶段 1 即失败：图库必须零实体（无任何部分写入）
     assert graph.count_entities() == 0
     # 数据记录已建但状态必须流转为 failed，便于后续排查/重试
-    assert rel.get_data_by_hash(content_hash("一些文本"))["status"] == "failed"
+    # （get_data_by_hash 为数据集维度联表查询，需先取 default 数据集 id）
+    ds = rel.get_or_create_dataset("default")
+    assert rel.get_data_by_hash(content_hash("一些文本"), ds["id"])["status"] == "failed"
 
 
 async def test_list_datasets(make_service):

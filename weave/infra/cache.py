@@ -1,10 +1,12 @@
-"""Redis 封装: 会话记忆 list + 任务队列 (spec §4.3).
+"""Redis 封装: 会话记忆 list + synced 集合 + 任务队列 (spec §4.3).
 
 dequeue_priority 用单次 BRPOP 多 key: Redis 按 key 顺序扫描, 实现 improve 优先.
 
-会话记忆防污染的存储基础：会话原文只存 Redis（list 结构，带 TTL 与
-synced 标记），永不写入图库；任务队列用 list 实现，LPUSH 入队、
-BRPOP 阻塞出队，调用方把高优先级队列名放在 list 前面即可。
+会话记忆防污染的存储基础：会话原文只存 Redis（list 结构，带 TTL），
+永不写入图库；已同步状态存独立的 synced 集合（Redis SET，按条目 id
+打标），避免"读全量->翻标记->重写"在处理窗口内误标新到消息（竞态）。
+任务队列用 list 实现，LPUSH 入队、BRPOP 阻塞出队，调用方把高优先级
+队列名放在 list 前面即可。
 """
 
 import json
@@ -16,6 +18,17 @@ import redis.asyncio as aioredis
 QUEUE_IMPROVE = "weave:queue:improve"  # 会话整理（improve）任务队列键，优先级高于 cognify
 QUEUE_COGNIFY = "weave:queue:cognify"  # 文档认知（cognify）任务队列键
 _SESSION_PREFIX = "weave:session:"  # 会话记忆 list 的键前缀，完整键为 前缀+session_id
+
+
+def _synced_key(session_id: str) -> str:
+    """生成会话 synced 集合的完整 Redis 键（SET，存已同步条目的 id）。
+
+    参数:
+        session_id: 会话标识。
+    返回:
+        str: 形如 weave:session:{session_id}:synced 的键名。
+    """
+    return f"{_SESSION_PREFIX}{session_id}:synced"
 
 
 class Cache:
@@ -51,11 +64,12 @@ class Cache:
     # ---------- 会话记忆 ----------
     async def session_append(self, session_id: str, content: str,
                              max_items: int, ttl_seconds: int) -> None:
-        """向会话记忆 list 尾部追加一条消息，并裁剪长度、刷新 TTL。
+        """向会话记忆 list 尾部追加一条消息，并裁剪长度、刷新两键 TTL。
 
-        做什么: RPUSH 一条 JSON 序列化的消息项（id/content/ts/synced），
+        做什么: RPUSH 一条 JSON 序列化的消息项（id/content/ts/synced 占位），
             随后 LTRIM 只保留最新 max_items 条（裁剪最旧），最后 EXPIRE
-            刷新整个会话键的存活时间（每次写入都顺延过期）。
+            刷新会话列表键的存活时间；同时 EXPIRE synced 集合键，
+            保证两键 TTL 对齐（同生共死，集合不泄漏）。
         参数:
             session_id: 会话标识，拼在键前缀后定位 Redis list。
             content: 消息原文（会话原文只存 Redis，永不进图）。
@@ -64,16 +78,23 @@ class Cache:
         返回: 无。
         """
         key = _SESSION_PREFIX + session_id  # 会话 list 的完整 Redis 键
-        # 消息项四字段：uuid 十六进制 id、原文、Unix 秒时间戳、未同步标记
+        # 消息项四字段：uuid 十六进制 id、原文、Unix 秒时间戳、未同步占位
+        # （synced 真值由 synced 集合派生，此处仅保持消息项结构稳定）
         item = json.dumps({"id": uuid.uuid4().hex, "content": content,
                            "ts": time.time(), "synced": False})
         await self._r.rpush(key, item)  # 追加到 list 尾部（时间序即插入序）
         await self._r.ltrim(key, -max_items, -1)  # 只保留尾部最新 max_items 条，裁掉最旧
-        await self._r.expire(key, ttl_seconds)  # 刷新 TTL：活跃会话永不过期
+        await self._r.expire(key, ttl_seconds)  # 刷新列表键 TTL：活跃会话永不过期
+        # synced 集合键同步续期：两键 TTL 对齐，避免集合先于列表过期导致重复处理
+        await self._r.expire(_synced_key(session_id), ttl_seconds)
 
     async def session_get(self, session_id: str) -> list[dict]:
         """读取会话全部消息（含已同步与未同步），按插入顺序返回。
 
+        做什么: LRANGE 取全量条目后，SMEMBERS synced 集合逐个回填 synced
+            标记（条目 id 在集合中即已同步）；synced 不以消息项内字段为准
+            （append 时恒为 False 占位），而是按 id 从集合派生——这是
+            recall 与 unsynced 的统一事实来源。
         参数:
             session_id: 会话标识。
         返回:
@@ -81,10 +102,14 @@ class Cache:
             会话不存在或已过期时返回空列表。
         """
         rows = await self._r.lrange(_SESSION_PREFIX + session_id, 0, -1)  # 取全量（0 到末尾）
-        return [json.loads(r) for r in rows]  # 逐条反序列化 JSON 为 dict
+        synced_ids = await self._r.smembers(_synced_key(session_id))  # 已同步条目 id 集合
+        items = [json.loads(r) for r in rows]  # 逐条反序列化 JSON 为 dict
+        for i in items:
+            i["synced"] = i["id"] in synced_ids  # 覆盖占位：以 synced 集合为准
+        return items
 
     async def session_unsynced(self, session_id: str) -> list[dict]:
-        """读取会话中尚未同步（synced=False）的消息，供 improve 流程取增量。
+        """读取会话中尚未同步（id 不在 synced 集合中）的消息，供 improve 流程取增量。
 
         参数:
             session_id: 会话标识。
@@ -92,38 +117,38 @@ class Cache:
             list[dict]: 未同步消息项字典列表（字段同 session_get）；
             全部已同步或会话不存在时返回空列表。
         """
-        # 在全量消息上按 synced 标记过滤，只留未同步的
+        # session_get 已按 synced 集合回填标记，此处只留未同步的
         return [i for i in await self.session_get(session_id) if not i["synced"]]
 
-    async def session_mark_synced(self, session_id: str, ttl_seconds: int) -> None:
-        """把会话全部消息标记为已同步（synced=True），并刷新 TTL。
+    async def session_mark_synced(self, session_id: str, ttl_seconds: int,
+                                  ids: list[str]) -> None:
+        """按条目 id 把会话消息标记为已同步（SADD synced 集合），并刷新集合 TTL。
 
-        做什么: 读出全部消息项、逐项置 synced=True 后整体重写回 list
-            （delete + rpush），最后刷新 TTL；原文保留供 recall 检索，
-            只改标记不清除内容。会话为空时直接返回，避免误建空键。
+        做什么: 只把本次实际处理过的条目 id SADD 进 synced 集合（不再
+            "读全量->翻标记->重写 list"）：improve 处理窗口内新 append 的
+            消息 id 不在集合中，永不会被误标（竞态修复）；原文保留供
+            recall 检索，只加标记不清除内容。ids 为空时直接返回，
+            避免误建空键。
         参数:
             session_id: 会话标识。
-            ttl_seconds: 重写后会话键的过期秒数（由 session_ttl_days 换算）。
+            ttl_seconds: synced 集合键的过期秒数（与会话列表键 TTL 对齐）。
+            ids: 本次实际处理过的条目 id 列表（含被过滤丢弃的——它们已被评估过）。
         返回: 无。
         """
-        key = _SESSION_PREFIX + session_id  # 会话 list 的完整 Redis 键
-        items = await self.session_get(session_id)
-        if not items:
-            return  # 空会话无需标记；也避免 delete+rpush 造出无 TTL 的空键
-        for i in items:
-            i["synced"] = True  # 逐项打标：已被 improve 流程消费入库
-        await self._r.delete(key)  # 先整体删除旧 list，再重建（替代逐条 LSET）
-        await self._r.rpush(key, *[json.dumps(i) for i in items])  # 按原顺序重写全部消息项
-        await self._r.expire(key, ttl_seconds)  # 刷新 TTL：delete 会清掉旧过期时间
+        if not ids:
+            return  # 无可标记条目：避免 SADD 空集造出无意义键
+        key = _synced_key(session_id)  # 会话 synced 集合的完整 Redis 键
+        await self._r.sadd(key, *ids)  # 按 id 打标：集合外的新消息不受影响
+        await self._r.expire(key, ttl_seconds)  # 刷新集合键 TTL：与列表键同生共死
 
     async def session_clear(self, session_id: str) -> None:
-        """删除整个会话记忆 list（键不存在时为无害空操作）。
+        """删除整个会话记忆（list 与 synced 集合两键一并删除，键不存在时为无害空操作）。
 
         参数:
             session_id: 会话标识。
         返回: 无。
         """
-        await self._r.delete(_SESSION_PREFIX + session_id)
+        await self._r.delete(_SESSION_PREFIX + session_id, _synced_key(session_id))
 
     # ---------- 任务队列 ----------
     async def enqueue(self, queue: str, payload: dict) -> None:

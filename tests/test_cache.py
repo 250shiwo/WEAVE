@@ -1,8 +1,8 @@
-"""Redis 缓存封装测试：会话记忆 list（追加/裁剪/TTL/synced 标记）+ 优先级队列。
+"""Redis 缓存封装测试：会话记忆 list（追加/裁剪/TTL/synced 集合打标）+ 优先级队列。
 
 会话原文只存 Redis、永不进图（防污染机制③的存储基础），本模块验证：
 1. 会话追加保序、超出上限裁剪最旧条目、键带 TTL；
-2. unsynced 过滤与 mark_synced 标记后原文仍保留；
+2. unsynced 过滤与 mark_synced 按 id 打标后原文仍保留；
 3. 单次 BRPOP 多 key 实现 improve 队列优先消费、空队列超时返回 None。
 """
 
@@ -35,21 +35,26 @@ async def test_session_append_trim_and_ttl(settings, fake_cache):
 
 
 async def test_session_unsynced_and_mark_synced(settings, fake_cache):
-    """验证 unsynced 过滤与 mark_synced 后原文保留（供 recall）。
+    """验证 unsynced 过滤与 mark_synced 按 id 打标后原文保留（供 recall）。
 
     参数:
         settings: 测试配置夹具（提供 session_ttl_days 换算标记后的 TTL）。
         fake_cache: 注入 FakeRedis 的 Cache 夹具。
     断言:
-        追加 2 条后 unsynced 为 2；mark_synced 后 unsynced 为空，
-        但 get_session 仍能取到 2 条原文（标记不清除内容）。
+        追加 2 条后 unsynced 为 2；按条目 id 打标后 unsynced 为空，
+        但 get_session 仍能取到 2 条原文（标记不清除内容），且 synced
+        标记由 synced 集合派生为 True。
     """
     await append_session(fake_cache, settings, "s2", "甲")
     await append_session(fake_cache, settings, "s2", "乙")
-    assert len(await get_unsynced(fake_cache, "s2")) == 2
-    await mark_synced(fake_cache, settings, "s2")
+    unsynced = await get_unsynced(fake_cache, "s2")
+    assert len(unsynced) == 2
+    # 按本次处理过的条目 id 打标（improve 流程的真实调用形态）
+    await mark_synced(fake_cache, settings, "s2", [i["id"] for i in unsynced])
     assert await get_unsynced(fake_cache, "s2") == []
-    assert len(await get_session(fake_cache, "s2")) == 2  # 原文保留供 recall
+    items = await get_session(fake_cache, "s2")
+    assert len(items) == 2  # 原文保留供 recall
+    assert all(i["synced"] is True for i in items)  # synced 标记由 SET 派生
 
 
 async def test_queue_priority_improve_first(fake_cache):

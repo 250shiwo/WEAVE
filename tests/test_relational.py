@@ -21,11 +21,12 @@ def store(settings):
 
 
 def test_dataset_and_data_crud(store):
-    """验证数据集与数据条目的基本读写：按名幂等建数据集、按哈希去重查数据、状态流转。
+    """验证数据集与数据条目的基本读写：按名幂等建数据集、按哈希+数据集联表查数据、状态流转。
 
     做什么: 覆盖 get_or_create_dataset 的幂等性（同名返回同一 id）、
         create_data/link_dataset_data/get_data_by_hash/get_data/set_data_status/
-        list_datasets 的正常读写路径。
+        list_datasets 的正常读写路径；get_data_by_hash 为数据集维度联表查询，
+        跨数据集的同哈希数据互不命中。
     参数: 无（使用 store 夹具）。
     返回: 无；断言各读取接口返回的字段值符合写入预期。
     """
@@ -38,8 +39,10 @@ def test_dataset_and_data_crud(store):
     # 写入一条数据并关联到数据集；初始状态应为 created
     store.create_data("d1", "note", "用户喜欢咖啡", "hash1", "remember")
     store.link_dataset_data(ds["id"], "d1")
-    # 按内容哈希可反查同一条数据（去重依赖此接口）
-    assert store.get_data_by_hash("hash1")["id"] == "d1"
+    # 按内容哈希 + 数据集联表反查同一条数据（去重依赖此接口，限定数据集内）
+    assert store.get_data_by_hash("hash1", ds["id"])["id"] == "d1"
+    # 同哈希但未关联到该数据集时不命中（跨数据集去重互不干扰）
+    assert store.get_data_by_hash("hash1", "other-dataset-id") is None
     assert store.get_data("d1")["status"] == "created"
     # 状态流转：created -> completed
     store.set_data_status("d1", "completed")

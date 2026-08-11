@@ -120,7 +120,7 @@ class MemoryService:
         """触发一次会话记忆沉淀：improve_session 管线的门面入口。
 
         做什么: 把调用原样委托给 pipelines.improve_session——取会话未同步
-            消息、LLM 认知过滤、保留事实走标准入图、标记已同步。
+            消息、LLM 认知过滤、保留事实走标准入图、按 id 标记已同步。
         参数:
             session_id: 会话标识。
             dataset: 目标数据集名，默认 "default"。
@@ -157,10 +157,13 @@ class MemoryService:
         做什么:
             1. 校验文件扩展名（v1 仅支持 txt/md/markdown）并解码 base64 为
                UTF-8 文本，任一失败抛 ValueError（不产生任何写入）；
-            2. 按解码后文本的内容哈希去重：哈希命中且已挂在当前数据集下时，
-               只补一条已完成的 pipeline_run 记录作为审计痕迹，直接返回
-               completed + deduplicated（不入队、不重复抽取）；
-            3. 未命中时创建 data 记录（source_pipeline="cognify"）并关联数据集，
+            2. 按解码后文本的内容哈希在数据集内联表去重：命中且记录为
+               completed 时，只补一条已完成的 pipeline_run 记录作为审计痕迹，
+               直接返回 completed + deduplicated（不入队、不重复抽取）；
+            3. 命中但记录为非完成态（上次执行失败等）时，复用其 data_id
+               新建 pending 运行记录并重新入队（绝不假报 completed——
+               图中尚无数据，返回 pending 等待重跑）；
+            4. 未命中时创建 data 记录（source_pipeline="cognify"）并关联数据集，
                创建 pending 状态的 pipeline_run，把 {task_id, data_id, dataset}
                载荷入 QUEUE_COGNIFY，等待 worker 异步执行 run_cognify_task。
         参数:
@@ -168,8 +171,9 @@ class MemoryService:
             content_base64: 文件内容的 base64 编码字符串（解码后须为 UTF-8）。
             dataset: 目标数据集名，默认 "default"。
         返回:
-            dict: 新任务为 {task_id, data_id, status: "pending"}；
-                去重命中时额外带 deduplicated: True 且 status 为 "completed"。
+            dict: 新任务（含失败重提）为 {task_id, data_id, status: "pending"}；
+                去重短路（命中已完成记录）时额外带 deduplicated: True 且
+                status 为 "completed"。
         异常:
             ValueError: 扩展名不支持或 base64 解码失败时抛出。
         """
@@ -192,21 +196,27 @@ class MemoryService:
 
         # 数据集按名获取/创建（幂等），后续关联与去重判定都基于它的内部 id
         ds = await self.db(self.relational.get_or_create_dataset, dataset)
-        # 内容哈希去重：同文本同数据集只入库一次
+        # 内容哈希去重：同文本同数据集只入库一次（联表查询限定数据集内，
+        # 跨数据集的同内容互不干扰，也不会因同哈希多行而抛 MultipleResultsFound）
         ch = content_hash(raw)
-        existing = await self.db(self.relational.get_data_by_hash, ch)
-        if existing and await self.db(self.relational.is_data_linked, ds["id"], existing["id"]):
-            # 去重命中：补一条直接置 completed 的运行记录作为审计痕迹，不入队
+        existing = await self.db(self.relational.get_data_by_hash, ch, ds["id"])
+        if existing and existing["status"] == "completed":
+            # 去重短路仅对已完成记录生效：补一条直接置 completed 的运行记录作审计，不入队
             task_id = new_id()
             await self.db(self.relational.create_pipeline_run, task_id, "cognify", existing["id"])
             await self.db(self.relational.update_pipeline_run, task_id, "completed")
             return {"task_id": task_id, "data_id": existing["id"],
                     "status": "completed", "deduplicated": True}
 
-        # 未命中：先落 data 记录（状态 created，由 run_cognify_task 流转终态）
-        data_id = new_id()
-        await self.db(self.relational.create_data, data_id, file_name, raw, ch, "cognify")
-        await self.db(self.relational.link_dataset_data, ds["id"], data_id)
+        if existing:
+            # 非完成态（上次执行失败等）：复用已有 data_id 重新入队重跑，
+            # 返回 pending 而非 completed（图中尚无数据，不假报完成、不静默丢数据）
+            data_id = existing["id"]
+        else:
+            # 未命中：先落 data 记录（状态 created，由 run_cognify_task 流转终态）
+            data_id = new_id()
+            await self.db(self.relational.create_data, data_id, file_name, raw, ch, "cognify")
+            await self.db(self.relational.link_dataset_data, ds["id"], data_id)
         # 建立 pending 状态的运行记录，供 task_status 查询进度
         task_id = new_id()
         await self.db(self.relational.create_pipeline_run, task_id, "cognify", data_id)

@@ -50,18 +50,21 @@ async def get_unsynced(cache, session_id: str) -> list[dict]:
         cache: Cache 缓存封装实例。
         session_id: 会话标识。
     返回:
-        list[dict]: synced=False 的消息项字典列表，全部已同步时为 []。
+        list[dict]: id 不在 synced 集合中的消息项字典列表，全部已同步时为 []。
     """
     return await cache.session_unsynced(session_id)
 
 
-async def mark_synced(cache, settings, session_id: str) -> None:
-    """把会话全部消息标记为已同步，并刷新 TTL（原文保留供 recall）。
+async def mark_synced(cache, settings, session_id: str, ids: list[str]) -> None:
+    """把指定 id 的会话消息标记为已同步（按 id 打标，原文保留供 recall）。
 
     参数:
         cache: Cache 缓存封装实例。
         settings: 全局 Settings 实例，提供 session_ttl_days 换算标记后的 TTL。
         session_id: 会话标识。
+        ids: 本次实际处理过的条目 id 列表（含被过滤丢弃的）；空列表直接返回，
+            不产生任何写入。处理窗口内新 append 的消息 id 不在列表中，
+            永不会被误标（竞态修复）。
     返回: 无。
     """
-    await cache.session_mark_synced(session_id, _ttl_seconds(settings))
+    await cache.session_mark_synced(session_id, _ttl_seconds(settings), ids)
