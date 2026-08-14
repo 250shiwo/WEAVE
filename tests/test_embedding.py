@@ -67,3 +67,42 @@ async def test_embed_empty_input():
 async def test_embed_retries_transient_failure():
     """embed 遇到一次瞬时 ConnectionError 后由 with_retry 重试并成功返回向量。"""
     assert await _client(fail_times=1).embed(["a"]) == [[1.0, 0.0]]
+
+
+class _BatchProbeEmbeddings:
+    """记录每批 input 大小的桩：验证超限输入被自动分批（DashScope 单批上限 20）。"""
+
+    def __init__(self):
+        """初始化探针桩，batch_sizes 记录每次 create 收到的条数。"""
+        self.batch_sizes: list[int] = []
+
+    async def create(self, model, input):
+        """记录本批条数，并为每条输入返回其在全局输入中的序号向量。
+
+        参数:
+            model: 模型名（桩中忽略）。
+            input: 本批待嵌入文本列表。
+        返回:
+            SimpleNamespace: data 为与 input 等长的向量列表，向量值取文本
+                自身的序号（如 "t7" -> [7.0]），用于验证跨批拼接后顺序不乱。
+        """
+        self.batch_sizes.append(len(input))
+        # 文本形如 "t0".."tN"，取出序号作为向量，便于校验总顺序与输入一致
+        return SimpleNamespace(
+            data=[SimpleNamespace(embedding=[float(t[1:])]) for t in input]
+        )
+
+
+async def test_embed_batches_when_exceeding_limit():
+    """45 条输入按 batch_size=20 自动分为 3 批（20/20/5），结果顺序与输入一致。"""
+    probe = _BatchProbeEmbeddings()
+    stub = SimpleNamespace(embeddings=probe)
+    client = EmbeddingClient("k", "http://x", "m", client=stub, batch_size=20)
+
+    texts = [f"t{i}" for i in range(45)]
+    out = await client.embed(texts)
+
+    # 断言分三批调用且每批不超上限
+    assert probe.batch_sizes == [20, 20, 5]
+    # 断言返回 45 个向量且顺序与输入一一对应（跨批拼接不乱序）
+    assert out == [[float(i)] for i in range(45)]
