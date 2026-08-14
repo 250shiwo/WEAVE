@@ -30,6 +30,11 @@ def make_bearer_middleware(api_key: str):
         返回:
             Response: 豁免/鉴权通过时为下游响应；鉴权失败时为 401 JSON 响应。
         """
+        # CORS 预检（OPTIONS）直接放行：预检请求按浏览器规范不携带
+        # Authorization 头，若进入鉴权必被误判为 401，导致跨域前端不可用。
+        # 实际的跨域响应头由 CORSMiddleware 在更外层统一附加。
+        if request.method == "OPTIONS":
+            return await call_next(request)
         # 豁免路径直接放行：/v1/health 无需任何鉴权头
         if request.url.path in _EXEMPT_PATHS:
             return await call_next(request)

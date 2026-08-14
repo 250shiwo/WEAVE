@@ -111,9 +111,22 @@ def create_app(settings: Settings, service: MemoryService | None = None) -> Fast
                   openapi_url=None, lifespan=lifespan)
     # 服务门面挂到应用状态，路由层经 request.app.state.service 取用
     app.state.service = svc
-    # 注册 Bearer 认证中间件（函数工厂模式，仅豁免 /v1/health）；
+    # 注册 Bearer 认证中间件（函数工厂模式，仅豁免 /v1/health 与 OPTIONS 预检）；
     # 中间件包裹整个应用（含挂载的 MCP 子应用），/mcp 与 /v1 同等受保护
     app.middleware("http")(make_bearer_middleware(settings.weave_api_key))
+    # CORS 支持：允许浏览器前端（如 data/web-ui）跨域调用 API。
+    # add_middleware 在 app.middleware("http") 之后注册，位于中间件栈更外层，
+    # 因此 OPTIONS 预检请求由 CORSMiddleware 优先响应（不进入认证逻辑）。
+    # 本地单用户工具场景，allow_origins 用 "*"（Bearer token 鉴权、无 cookie 凭证，
+    # 不受 "*" 与 credentials 冲突限制）；对外暴露时应收紧为具体来源列表。
+    from fastapi.middleware.cors import CORSMiddleware
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     @app.exception_handler(ValueError)
     async def value_error_handler(request, exc):
