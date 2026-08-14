@@ -10,14 +10,18 @@ dequeue_priority 用单次 BRPOP 多 key: Redis 按 key 顺序扫描, 实现 imp
 """
 
 import json
+import logging
 import time
 import uuid
 
+import redis
 import redis.asyncio as aioredis
 
 QUEUE_IMPROVE = "weave:queue:improve"  # 会话整理（improve）任务队列键，优先级高于 cognify
 QUEUE_COGNIFY = "weave:queue:cognify"  # 文档认知（cognify）任务队列键
 _SESSION_PREFIX = "weave:session:"  # 会话记忆 list 的键前缀，完整键为 前缀+session_id
+
+logger = logging.getLogger(__name__)
 
 
 def _synced_key(session_id: str) -> str:
@@ -166,15 +170,29 @@ class Cache:
 
         做什么: 一次 BRPOP 传入全部队列键，Redis 按列表顺序扫描、命中第一个
             非空队列即弹出（禁止拆成多个独立 BRPOP，否则优先级语义失效）；
-            全部为空则阻塞至 timeout 后返回 None。
+            全部为空则阻塞至 timeout 后返回 None。BRPOP 的客户端读超时竞争
+            与连接中断也在此兜底为返回 None——异常若上抛到 worker_loop 的
+            try 之外会使 worker 任务静默死亡、队列无人消费，因此韧性逻辑
+            内聚在本层，调用方只需按"超时无任务"继续轮询。
         参数:
             queues: 队列键列表，靠前的优先级更高（如 [improve, cognify]）。
             timeout: 阻塞等待秒数，超时返回 None。
         返回:
             tuple[str, dict] | None: (命中的队列键, 反序列化后的载荷字典)；
-            超时无任务时返回 None。
+            超时无任务、客户端读超时竞争或连接中断（Redis 重启中）时
+            均返回 None。
         """
-        result = await self._r.brpop(queues, timeout=timeout)  # 单次多 key BRPOP：key 序即优先级
+        try:
+            result = await self._r.brpop(queues, timeout=timeout)  # 单次多 key BRPOP：key 序即优先级
+        except redis.exceptions.TimeoutError:
+            # 客户端读超时竞争：redis 8.x 客户端 socket 读超时与 BRPOP 服务端
+            # timeout 接近，服务端即将返回 nil 时客户端可能竞争先触发抛错；
+            # 语义等同"本轮无任务"，兜底返回 None 让 worker 继续轮询
+            return None
+        except redis.exceptions.ConnectionError:
+            # Redis 可能重启中：记 warning 后按无任务处理，worker 继续轮询等其恢复
+            logger.warning("BRPOP 连接中断（Redis 重启中?），本轮按无任务处理，继续轮询")
+            return None
         if result is None:
             return None  # 超时：所有队列均无任务
         queue, raw = result  # brpop 返回 (键名, 弹出的 JSON 字符串)

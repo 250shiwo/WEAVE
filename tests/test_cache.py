@@ -3,11 +3,36 @@
 会话原文只存 Redis、永不进图（防污染机制③的存储基础），本模块验证：
 1. 会话追加保序、超出上限裁剪最旧条目、键带 TTL；
 2. unsynced 过滤与 mark_synced 按 id 打标后原文仍保留；
-3. 单次 BRPOP 多 key 实现 improve 队列优先消费、空队列超时返回 None。
+3. 单次 BRPOP 多 key 实现 improve 队列优先消费、空队列超时返回 None；
+4. BRPOP 客户端读超时竞争与连接中断均按"本轮无任务"返回 None（worker 韧性回归）。
 """
 
+import redis
+
 from weave.core.session import append_session, get_session, get_unsynced, mark_synced
-from weave.infra.cache import QUEUE_COGNIFY, QUEUE_IMPROVE
+from weave.infra.cache import QUEUE_COGNIFY, QUEUE_IMPROVE, Cache
+
+
+class _BrpopErrorStub:
+    """只实现 brpop 的 Redis 客户端 stub：调用即抛出预置异常（模拟真实客户端故障）。"""
+
+    def __init__(self, exc: Exception):
+        """初始化 stub，保存 brpop 被调用时要抛出的异常实例。
+
+        参数:
+            exc: 待抛异常，如 redis.exceptions.TimeoutError / ConnectionError。
+        """
+        self._exc = exc
+
+    async def brpop(self, keys, timeout):
+        """模拟 brpop 调用失败：无条件抛出预置异常。
+
+        参数:
+            keys: 队列键列表（忽略）。
+            timeout: 阻塞秒数（忽略）。
+        返回: 无（调用即抛 self._exc，永不正常返回）。
+        """
+        raise self._exc
 
 
 async def test_session_append_trim_and_ttl(settings, fake_cache):
@@ -74,3 +99,32 @@ async def test_queue_priority_improve_first(fake_cache):
     second = await fake_cache.dequeue_priority([QUEUE_IMPROVE, QUEUE_COGNIFY], timeout=1)
     assert second[0] == QUEUE_COGNIFY
     assert await fake_cache.dequeue_priority([QUEUE_IMPROVE, QUEUE_COGNIFY], timeout=1) is None
+
+
+async def test_dequeue_brpop_timeout_returns_none():
+    """回归：brpop 抛 redis TimeoutError（客户端读超时竞争）时按"本轮无任务"返回 None。
+
+    背景: redis 8.x 客户端在 BRPOP 服务端 timeout 即将返回 nil 时，客户端
+        socket 读超时可能竞争先触发抛 redis.exceptions.TimeoutError；该异常
+        曾在 worker_loop try 之外上抛，导致 worker 任务静默死亡、队列无人消费。
+    断言:
+        dequeue_priority 捕获该异常并返回 None（语义等同超时无任务），
+        worker 因此继续轮询而不是退出。
+    """
+    cache = Cache("localhost", 6379, 0,  # host/port/db 在注入 client 后被忽略
+                  client=_BrpopErrorStub(
+                      redis.exceptions.TimeoutError("Timeout reading from 127.0.0.1:6379")))
+    assert await cache.dequeue_priority([QUEUE_IMPROVE, QUEUE_COGNIFY], timeout=1) is None
+
+
+async def test_dequeue_brpop_connection_error_returns_none():
+    """回归：brpop 抛 redis ConnectionError（Redis 重启中）时返回 None，不中断轮询。
+
+    断言:
+        dequeue_priority 捕获 redis.exceptions.ConnectionError 并返回 None，
+        worker 继续下一轮 BRPOP（等 Redis 恢复后自动重新消费），而非退出。
+    """
+    cache = Cache("localhost", 6379, 0,  # host/port/db 在注入 client 后被忽略
+                  client=_BrpopErrorStub(
+                      redis.exceptions.ConnectionError("Connection closed by server")))
+    assert await cache.dequeue_priority([QUEUE_IMPROVE, QUEUE_COGNIFY], timeout=1) is None

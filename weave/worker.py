@@ -21,7 +21,8 @@ async def worker_loop(service, cache, poll_timeout: int, stop: asyncio.Event) ->
         一致，直接 **payload 解包调用。超时无任务则继续轮询，stop 置位后退出。
     参数:
         service: MemoryService 门面，提供 run_improve / run_cognify_task。
-        cache: 缓存客户端，提供 dequeue_priority（单次多 key BRPOP）。
+        cache: 缓存客户端，提供 dequeue_priority（单次多 key BRPOP；其内部
+            已兜底客户端读超时竞争与连接中断为返回 None，worker 永不因此退出）。
         poll_timeout: 每轮 BRPOP 的阻塞秒数；超时返回 None 继续下一轮，
             同时它也是 stop 信号的最大响应延迟。
         stop: 停止信号；置位后当前轮 BRPOP 返回即退出循环（幂等可重复置位）。
@@ -30,8 +31,10 @@ async def worker_loop(service, cache, poll_timeout: int, stop: asyncio.Event) ->
         run_cognify_task 内部已自行兜底（置 failed 不上抛），此 except 是
         针对 run_improve 上抛与意外错误的最后防线。
     """
+    logger.info("worker_loop 启动, poll_timeout=%s", poll_timeout)
     while not stop.is_set():
-        # 单次 BRPOP 传入两个队列键：key 序即优先级，improve 永远先于 cognify
+        # 单次 BRPOP 传入两个队列键：key 序即优先级，improve 永远先于 cognify；
+        # 读超时竞争/连接中断已由 cache.dequeue_priority 内聚兜底为返回 None
         item = await cache.dequeue_priority([QUEUE_IMPROVE, QUEUE_COGNIFY], poll_timeout)
         if item is None:
             continue  # 本轮超时无任务：回到循环头检查 stop 后继续阻塞轮询

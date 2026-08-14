@@ -5,6 +5,8 @@
 清晰的中文报错并以非零码退出。
 """
 
+import logging
+
 import uvicorn
 
 from weave.api.app import create_app
@@ -21,6 +23,10 @@ def main() -> None:
             消息中含原始异常摘要，进程以非零码退出。
     """
     settings = get_settings()
+    # 生产可观测性：INFO 级别让 weave.worker 的启动/任务失败日志可见
+    logging.basicConfig(level=logging.INFO)
+    # httpx 每次 HTTP 请求都打 INFO 日志（LLM/嵌入调用频繁），噪音大；压到 WARNING 只留异常
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     try:
         app = create_app(settings)
     except Exception as exc:
