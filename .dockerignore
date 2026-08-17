@@ -1,64 +1,27 @@
-# .dockerignore: 构建上下文排除项 (减小镜像体积)
+# ============================================
+# Docker 构建上下文排除清单
+# 目标：缩小上下文体积、避免把密钥/本地数据打进镜像
+# ============================================
 
-# Git
-.git
-.gitignore
+# 密钥：绝不进入镜像，运行时经 env_file / environment 注入
+.env
 
-# 本地开发工具
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# 测试与缓存
-.pytest_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-.tox/
-.nox/
-
-# 虚拟环境
-.venv/
-venv/
-env/
-ENV/
-
-# Docker
-Dockerfile*
-docker-compose*.yml
-.dockerignore
-docker/
-
-# 数据目录（SQLite/LanceDB/Kuzu产物）
+# 本地数据目录：三库数据与前端页面，运行时通过卷挂载
 data/
 
-# 调试脚本
-.repro*.py
-
-# IDE
-*.sublime-workspace
-*.sublime-project
-
-# OS
-.DS_Store
-Thumbs.db
-
-# 日志
-*.log
-logs/
-
-# MCP 临时文件
-mcp.json
-.mcp.json
-
-# Python 编译产物
+# 本地虚拟环境与 Python 缓存（镜像内会重新创建 .venv）
+.venv/
+venv/
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
+*.pyc
+.ruff_cache/
+.pytest_cache/
+.pytest_tmp/
 
-# Weave 特定
-*.md  # 只保留必要 README，避免注释过多增大层
-.env  # 密钥不提交到镜像中
+# 测试、文档与 SDD 执行台账不参与运行时镜像
+tests/
+docs/
+.superpowers/
+
+# 版本控制元数据
+.git/

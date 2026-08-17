@@ -1,98 +1,73 @@
-# docker-compose.yml: Weave 服务编排
-# 
-# 用途：一键启动完整 Weave 环境（API + MCP + Redis）
-# 端口映射：
-# - 8000: Weave REST API + MCP (http://localhost:8000)
-# - 6379: Redis (仅容器内可用，不暴露端口，建议用独立 Redis 或禁用 redis 服务仅用缓存)
-# 数据持久化:
-# - ./data:/data (SQLite/LanceDB/Kuzu/向量图数据库)
-# - 临时文件 /tmp/caches (已挂载在 Docker 内部，无需卷)
+# ============================================
+# Weave - 容器编排
 #
-# 环境变量 (.env):
-# - WEAVE_API_KEY: Bearer token (生产环境必须改!)
-# - DASHSCOPE_API_KEY: DashScope embedding key (真实 API key)
-# - DEEPSEEK_API_KEY: DeepSeek 抽取模型 key (真实 API key)
-# - REDIS_HOST: Redis 地址 ("redis" 时内置, "127.0.0.1" 时使用外部 Redis)
-# - VECTOR_DB_PATH, GRAPH_DB_PATH, RELATIONAL_DB_PATH: 存储路径
+# 默认启动：redis + weave 两个服务
+#   docker compose up -d --build
 #
+# full profile：额外启动 web-ui 前端静态站点（nginx，宿主 8080 端口）
+#   docker compose --profile full up -d --build
+#
+# 密钥与行为参数经 .env 注入（env_file）；容器内连接地址由
+# environment 强制覆盖（优先级高于 env_file），与本地开发配置解耦。
+# ============================================
 
-version: "3.9"
+name: weave
 
 services:
-  weave:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: weave-memories
-    restart: unless-stopped
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./data:/data
-    env_file:
-      - .env
-    environment:
-      # 显式覆写 compose 中的默认值，支持 .env 变量替换
-      - WEAVE_API_KEY=${WEAVE_API_KEY:-dev-key}
-      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
-      - REDIS_HOST=${REDIS_HOST:-redis}
-      - REDIS_PORT=${REDIS_PORT:-6379}
-      - REDIS_DB=${REDIS_DB:-0}
-      - WEAVE_HOST=${WEAVE_HOST:-0.0.0.0}
-      - WEAVE_PORT=${WEAVE_PORT:-8000}
-      - VECTOR_DB_PATH=${VECTOR_DB_PATH:-/data/vector_db}
-      - GRAPH_DB_PATH=${GRAPH_DB_PATH:-/data/graph_db}
-      - RELATIONAL_DB_PATH=${RELATIONAL_DB_PATH:-/data/weave.db}
-      - CHUNK_SIZE=${CHUNK_SIZE:-1500}
-      - CHUNK_OVERLAP=${CHUNK_OVERLAP:-200}
-      - DB_CALL_TIMEOUT=${DB_CALL_TIMEOUT:-30.0}
-      - DB_CALL_MAX_RETRIES=${DB_CALL_MAX_RETRIES:-2}
-      - QUEUE_POLL_TIMEOUT=${QUEUE_POLL_TIMEOUT:-5}
-      - SESSION_MAX_ITEMS=${SESSION_MAX_ITEMS:-50}
-      - SESSION_TTL_DAYS=${SESSION_TTL_DAYS:-7}
-      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-v4-flash}
-      - DASHSCOPE_EMBEDDING_MODEL=${DASHSCOPE_EMBEDDING_MODEL:-qwen3.7-text-embedding}
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 15s
-    depends_on:
-      redis:
-        condition: service_healthy
-    networks:
-      - weave-network
-    profiles:
-      - full
-
-  # 可选: 独立 Redis 服务 (如需高可用可注释掉此段，使用外部 Redis)
-  # 注意：生产环境建议用 Redis Enterprise/AWS ElastiCache 等托管服务
+  # ---------- Redis：缓存 + improve/cognify 任务队列 ----------
   redis:
     image: redis:7-alpine
-    container_name: weave-redis
-    restart: unless-stopped
-    command: redis-server --appendonly yes
-    ports:
-      - "6379:6379"
+    # appendonly 持久化：避免容器重启后队列中的待处理任务与任务状态丢失
+    command: ["redis-server", "--appendonly", "yes"]
     volumes:
-      - redis-data:/data
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 5s
-    networks:
-      - weave-network
-    profiles:
-      - full
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ---------- Weave 主服务：REST /v1 + MCP /mcp（内嵌 worker 协程） ----------
+  weave:
+    build: .
+    image: weave:latest
+    # .env 不存在时不报错（required: false 需要 Compose v2.24+）；
+    # 也可完全靠 environment / 外部环境变量注入配置
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # 覆盖 .env 中的 127.0.0.1：compose 网络内以服务名互相寻址；
+      # 监听地址必须为 0.0.0.0，否则宿主端口映射无法进入容器
+      WEAVE_HOST: 0.0.0.0
+      REDIS_HOST: redis
+    ports:
+      # 宿主 8000 -> 容器 8000；如需修改宿主端口改左侧即可
+      - "8000:8000"
+    volumes:
+      # 三库数据（向量库/图库/SQLite）持久化到 named volume
+      - weave_data:/app/data
+    depends_on:
+      redis:
+        # 等 Redis 探活通过再启动，避免 worker 启动初期 BRPOP 连不上
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------- 前端静态站点（full profile，可选） ----------
+  # 纯 HTML+CSS+JS 无构建工具，nginx 直接托管 data/web-ui 目录；
+  # 只读挂载，宿主上修改页面刷新即生效
+  web-ui:
+    image: nginx:1.27-alpine
+    profiles: ["full"]
+    volumes:
+      - ./data/web-ui:/usr/share/nginx/html:ro
+    ports:
+      - "8080:80"
+    depends_on:
+      - weave
+    restart: unless-stopped
 
 volumes:
-  redis-data:
-    driver: local
-
-networks:
-  weave-network:
-    driver: bridge
+  redis_data:
+  weave_data:
