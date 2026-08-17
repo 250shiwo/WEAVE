@@ -1,0 +1,64 @@
+# .dockerignore: 构建上下文排除项 (减小镜像体积)
+
+# Git
+.git
+.gitignore
+
+# 本地开发工具
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 测试与缓存
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+docker/
+
+# 数据目录（SQLite/LanceDB/Kuzu产物）
+data/
+
+# 调试脚本
+.repro*.py
+
+# IDE
+*.sublime-workspace
+*.sublime-project
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+logs/
+
+# MCP 临时文件
+mcp.json
+.mcp.json
+
+# Python 编译产物
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Weave 特定
+*.md  # 只保留必要 README，避免注释过多增大层
+.env  # 密钥不提交到镜像中
